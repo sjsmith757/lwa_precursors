@@ -1,0 +1,5 @@
+.vscode
+.ipynb_checkpoints
+MERRA2
+*.nc
+.flake8
