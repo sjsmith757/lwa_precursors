@@ -1,5 +1,8 @@
 .vscode
 .ipynb_checkpoints
 MERRA2
+ERA5_2019
 *.nc
 .flake8
+__pycache__
+.mypy_cache
