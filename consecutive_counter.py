@@ -36,8 +36,15 @@ def compute_consecutive_counts(arr: xr.DataArray, thresh: xr.DataArray) -> xr.Da
 
     """
 
+    # remove weird coordinates
+    arr_al = arr.assign_coords(
+        {c: np.round(arr[c].values, 4) for c in arr.dims if c != "time"}
+    )
+    thresh_al = thresh.assign_coords(
+        {c: np.round(thresh[c].values, 4) for c in thresh.dims if c != "time"}
+    )
     # number of times exceeding the threshold
-    counts = arr >= thresh
+    counts = arr_al >= thresh_al
     # total sum - cumulative sum = how many counts are remaining (+1 to include
     # the current count)
     succeeding_counts = (counts.sum("time") + 1 - counts.cumsum("time")).where(
@@ -45,8 +52,14 @@ def compute_consecutive_counts(arr: xr.DataArray, thresh: xr.DataArray) -> xr.Da
     )
     # the first time we exceed the threshold (counts jumps from 0 to 1)
     first_in_group = counts.astype("int").diff("time") == 1
-    #
-    group_starts = succeeding_counts.where(first_in_group, drop=True)
+    # make sure we don't drop any gridcell coordinates
+    time_starts = succeeding_counts.time.where(
+        first_in_group.any([d for d in counts.dims if d != "time"]), drop=True
+    )
+    group_starts = succeeding_counts.sel(time=time_starts).where(
+        first_in_group.sel(time=time_starts)
+    )
+    # remove the start of each group sum so each occurence in the group has the total number
     preceding_group_counts = (
         group_starts.reindex(time=arr.time).shift(time=-1).bfill("time").fillna(0)
     )
@@ -66,7 +79,7 @@ def compute_consecutive_counts(arr: xr.DataArray, thresh: xr.DataArray) -> xr.Da
 def basic_test_consecutive_counts():
     # a simple example where we can figure out what the answer should be
     arr_list = [1, 2, 3, 4, 5, 4, 3, 2, 1, 4, 3, 1, 3]
-    thresh = 3
+    thresh = xr.DataArray(3)
     # we need to add a time coordinate since compute_consecutive_counts is designed to
     # work with xarray objects
     arr = xr.DataArray(
@@ -77,32 +90,75 @@ def basic_test_consecutive_counts():
     print(compute_consecutive_counts(arr, thresh))
 
 
-def test_consecutive_counts():
+def test_consecutive_counts(yr=1982, mn=7, dur=7):
+    from calendar import monthrange
+
     # now we test on real data
-    # first load it all. including part of august to capture events which occur toward
-    # the end of the month
-    jul82files = sorted(Path("MERRA2/daily/TMAX").glob("*19820[7-8]??.nc"))[:38]
-    JAthresh = xr.open_mfdataset("MERRA2/stats/TMAXP95/*0[7-8]??.nc").TMAXP95
-    JAthresh = JAthresh.sel(lat=slice(30, 70))
-    JAthresh.load()
-    tmax = xr.open_mfdataset(jul82files).TMAX.sel(lat=slice(30, 70), lon=slice(-30, 40))
+    # first load it all. including part of the month before and month after to capture
+    # events which occur towad the end of the month
+
+    # get the number of days in each month and determine which indices constitute a few days
+    # before and after
+    month_days = [monthrange(yr, (d + 11) % 12 + 1)[1] for d in range(mn - 1, mn + 1)]
+    bounds = slice(month_days[0] - dur + 1, month_days[0] + month_days[1] + dur - 1)
+    # the first month in the dataset is a bit special since there's no previous month
+    if (yr == 1980) and (mn == 1):
+        bounds = slice(0, month_days[1] + dur - 1)
+    # get all the files before and after that month by using a modulo-12 counting
+    # (0=12, 1=1, 2=2, ..., 11=11, 12=12, 13=1)
+    # then if we have 0 or 13, we have to adjust the year accordingly
+    monfiles = sorted(
+        [
+            f
+            for m in range(mn - 1, mn + 2)
+            for f in Path("MERRA2/daily/TMAX").glob(
+                f"*{yr-(m==0)+(m==13)}{(m+11)%12+1:02d}??.nc"
+            )
+        ]
+    )[bounds]
+    # this one is easier because we don't have to adjust the year
+    threshfiles = sorted(
+        [
+            f
+            for m in range(mn - 1, mn + 2)
+            for f in Path("MERRA2/stats/TMAXP95/").glob(f"*{(m+11)%12+1:02d}??.nc")
+        ]
+    )
+    # but the first month in the dataset is still special
+    if (yr == 1980) and (mn == 1):
+        threshfiles = threshfiles[1:]
+    thresh = xr.open_mfdataset(threshfiles).TMAXP95
+    thresh = thresh.sel(lat=slice(30, 70))
+    thresh.load()
+    tmax = xr.open_mfdataset(monfiles).TMAX.sel(lat=slice(30, 70), lon=slice(-30, 40))
     tmax.load()
-    # let's use the july threshold in july and the august one in august. In order to do
-    # that, we have to add a time dimension corresponding to the month, and then populate
-    # it with the same values for each day in the month
-    JAthresh_daily = (
-        JAthresh.squeeze()
+    # let's use the threshold for the month only for the days in that month (and not for
+    # the padded days before/after). In order to do that, we have to add a time dimension
+    # corresponding to the month, and then populate it with the same values for each day
+    # in the month.
+    # we first identify the first day in each month that we retained.
+    # and again, the first month is special
+    if (yr == 1980) and (mn == 1):
+        anchor_times = [tmax.time[0].values, tmax.time[month_days[1]].values]
+    else:
+        anchor_times = [
+            tmax.time[0].values,
+            tmax.time[dur - 1].values,
+            tmax.time[month_days[1] + dur - 1].values,
+        ]
+    thresh_daily = (
+        thresh.squeeze()
         .rename(month="time")
-        .assign_coords(time=[tmax.time[0].values, tmax.time[31].values])
+        .assign_coords(time=anchor_times)
         .reindex(time=tmax.time)
         .ffill("time")
     )
-    # compute the counts
-    consec_counts = compute_consecutive_counts(tmax, JAthresh_daily).transpose(
+    # now compute the counts
+    consec_counts = compute_consecutive_counts(tmax, thresh_daily).transpose(
         "time", ...
     )
     # pick a day and see if the maximum duration event is done correctly
-    t0 = 21
+    t0 = 21 + dur - 1
     # get location of the max
     max_iloc = consec_counts[t0].argmax(["lat", "lon"])
     # we can't use the dictionary as is because it has some extra coordinates,
@@ -118,68 +174,80 @@ def test_consecutive_counts():
     # number of ones computed as the duration, followed by another 0. Note this may not
     # work exactly if we are at the beginning or end of the time period, we may miss the
     # initial/final 0
-    print(max_count)
     print(
-        (tmax >= JAthresh_daily)
+        f"the following array should have exactly {max_count} ones with zeros on either side:"
+    )
+    print(
+        (tmax >= thresh_daily)
         .isel(iloc_dict)
         .astype("int")[max_start : max_start + max_count + 2]
+        .values
     )
 
     # now let's look at some posssible heat wave events. We want to keep all times that
-    # have an event that is lasting longer than 7 days, and we only want to keep these
-    # times if they have more than a few grid points that are lasting longer than 7 days
+    # have an event that is lasting longer than the specified duration, and we only want
+    # to keep these times if they have more than a few grid points that are lasting longer
+    # than that threshold
     heatwave_counts = (
-        consec_counts.where((consec_counts >= 7).sum(["lat", "lon"]) > 5, drop=True)
+        consec_counts.where((consec_counts >= dur).sum(["lat", "lon"]) > 5, drop=True)
         .squeeze(drop=True)
-        .sel(time="1982-07")
+        .sel(time=f"{yr}-{mn:02d}")
         .reset_coords(drop=True)
     )
-    # compute how warm TMAX is compared to the average temperature of the month, so we
-    # can see if there is a true heat wave
-    tmax_anom = (
-        (tmax.sel(time=heatwave_counts.time) - tmax.mean("time"))
-        .squeeze(drop=True)
-        .sel(time="1982-07")
-        .reset_coords(drop=True)
-    )
+    # in case we don't find any, nothing to plot
+    if heatwave_counts.time.size > 0:
+        # compute how warm TMAX is compared to the average temperature of the month, so we
+        # can see if there is a true heat wave
+        tmax_anom = (
+            (tmax.sel(time=heatwave_counts.time) - tmax.mean("time"))
+            .squeeze(drop=True)
+            .sel(time=f"{yr}-{mn:02d}")
+            .reset_coords(drop=True)
+        )
 
-    # now plot
-    # figure out a good grid layout
-    ncols = 4
-    nrows = (heatwave_counts.time.size + ncols - 1) // ncols
-    fig, axs = plt.subplots(
-        nrows, ncols, subplot_kw={"projection": ccrs.PlateCarree()}, figsize=(14, 7)
-    )
-    ax: plt.Axes
-    # plot the temperature anomalies as shading and identified "heat wave" regions as
-    # contours, and make it look nice
-    for i, ax in enumerate(axs.flatten()):
-        if i < tmax_anom.time.size:
-            cs = tmax_anom.isel(time=i).plot(
-                ax=ax, add_colorbar=False, vmin=-10, vmax=10, cmap=plt.cm.RdBu_r
-            )
-            heatwave_counts.isel(time=i).plot.contour(
-                levels=[2, 5, 8], ax=ax, add_labels=False, colors="k"
-            )
-            ax.coastlines(color="grey")
-            plt.xlabel("")
-            plt.ylabel("")
+        # now plot
+        # figure out a good grid layout
+        if heatwave_counts.time.size > 4:
+            ncols = 4
+            nrows = (heatwave_counts.time.size + ncols - 1) // ncols
         else:
-            ax.remove()
-    fig.colorbar(
-        cs,
-        ax=axs.flatten()[: tmax_anom.time.size],
-        label="TMAX anomaly [K]",
-        orientation="horizontal",
-        extend="both",
-        aspect=30,
-    )
-    fig.subplots_adjust(bottom=0.25, top=0.95, left=0.03, right=0.97)
-    plt.show()
+            ncols = heatwave_counts.time.size
+            nrows = 1
+        fig, axs = plt.subplots(
+            nrows, ncols, subplot_kw={"projection": ccrs.PlateCarree()}, figsize=(14, 7)
+        )
+        ax: plt.Axes
+        # plot the temperature anomalies as shading and identified "heat wave" regions as
+        # contours, and make it look nice
+        for i, ax in enumerate(axs.flatten()):
+            if i < tmax_anom.time.size:
+                cs = tmax_anom.isel(time=i).plot(
+                    ax=ax, add_colorbar=False, vmin=-10, vmax=10, cmap=plt.cm.RdBu_r
+                )
+                heatwave_counts.isel(time=i).plot.contour(
+                    levels=[2, 5, 8], ax=ax, add_labels=False, colors="k"
+                )
+                ax.coastlines(color="grey")
+                plt.xlabel("")
+                plt.ylabel("")
+            else:
+                ax.remove()
+        fig.colorbar(
+            cs,
+            ax=axs.flatten()[: tmax_anom.time.size],
+            label="TMAX anomaly [K]",
+            orientation="horizontal",
+            extend="both",
+            aspect=30,
+        )
+        fig.subplots_adjust(bottom=0.25, top=0.95, left=0.03, right=0.97)
+        plt.show()
+    else:
+        print("no heatwaves found with specified duration")
 
 
 # this line is necessary to ensure our tests don't run if we import the function into
 # another notebook
 if __name__ == "__main__":
-    basic_test_consecutive_counts()
-    # test_consecutive_counts()
+    # basic_test_consecutive_counts()
+    test_consecutive_counts(2022, 11, 7)
